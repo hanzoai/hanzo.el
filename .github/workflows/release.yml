@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release archive
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          mkdir -p dist
+
+          # Create Emacs package tarball
+          tar -czvf dist/hanzo-${VERSION}.tar.gz \
+            --exclude='.git*' \
+            --exclude='dist' \
+            --exclude='.github' \
+            hanzo.el README.md
+
+          # Create single file for easy installation
+          cp hanzo.el dist/hanzo-${VERSION}.el
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/hanzo-*.tar.gz
+            dist/hanzo-*.el
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
