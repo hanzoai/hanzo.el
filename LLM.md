@@ -1,4 +1,4 @@
-# hanzo.el — AI Assistant Context
+# hanzo.el
 
 # hanzo.el
 
