@@ -1,3 +1,5 @@
+<p align="center"><img src=".github/hero.svg" alt="hanzo.el" width="880"></p>
+
 # hanzo.el
 
 Hanzo AI integration for Emacs. AI-powered code completion, explanation, refactoring, and more using Claude, GPT-4, Gemini, Ollama, and any OpenAI-compatible API.
