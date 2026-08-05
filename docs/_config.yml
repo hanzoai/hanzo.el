@@ -1,10 +1,26 @@
 title: hanzo.el
 description: AI-powered Emacs package
-url: https://hanzoai.github.io
-baseurl: /hanzo.el
-remote_theme: pages-themes/midnight@v0.2.0
-plugins:
-  - jekyll-remote-theme
+
+# The site serves from the root of its own host on the Hanzo Sites plane, so
+# there is no path prefix. It used to carry `baseurl: /hanzo.el` and a
+# `hanzoai.github.io` url, which are GitHub Pages project-page artifacts: every
+# root-relative link they produced would 404 here.
+url: https://hanzo-el.hanzo.app
+baseurl: ""
+
+# _layouts/default.html is a COMPLETE page — its own <html>, its own <style>,
+# its own header and footer. It never reads a theme's stylesheet or includes, so
+# `remote_theme: pages-themes/midnight` + the jekyll-remote-theme plugin were
+# fetching a theme whose output nothing rendered. They are also Pages-only
+# machinery (remote_theme resolves through the GitHub API), which is exactly what
+# keeps a site buildable in one place and one place only.
+markdown: kramdown
+highlighter: rouge
+
+# Directory permalinks, because that is what the site server actually resolves:
+# hanzoai/static answers `/page` from `page/index.html` and 404s on `page.html`.
+# One page today, but the rule has to be the config's, not the page count's.
+permalink: pretty
 
 defaults:
   - scope:

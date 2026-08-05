@@ -1,0 +1,172 @@
+name: deploy
+
+# The hanzo.el docs are a SITE, not an App.
+#
+# They used to publish through actions/deploy-pages — GitHub Pages built the
+# Jekyll source with actions/jekyll-build-pages and served it from
+# hanzoai.github.io/hanzo.el. That is a second deploy plane living outside our
+# own CI/CD, outside the Sites plane, and outside our analytics, so it is gone.
+#
+#   jekyll build docs -> _site
+#     -> POST /v1/projects/hanzo-el/deploy {"source":"git"}   (202, queued)
+#     -> aws s3 sync _site s3://<bucket>/<prefix>             (bytes skip the API)
+#     -> POST .../deployments/<id>/complete {"status":"live"}
+#
+# Modelled on hanzoai/hips .hanzo/workflows/deploy.yml, which is the canonical
+# shape for this. The bytes go straight to S3 rather than through an artifact
+# POST because /v1/event's door has a 16 MiB BodyLimit that fasthttp enforces
+# BEFORE any handler runs; cloud names the bucket and prefix in the 202 so CI
+# writes exactly where the site is served from and never has to guess.
+#
+# WHERE THIS FITS: a Site is static bytes, no compute. It is not an App (no CR,
+# no pods, no image) and not a Function. A docs export is the first of those and
+# only the first.
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**', '.hanzo/workflows/deploy.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  site:
+    # NOT ubuntu-latest. These run on the in-cluster act_runner, whose fleet
+    # advertises hanzo-build-linux-amd64. A label no runner answers does not
+    # fail — it queues until the 24h timeout, which is silence, not an error.
+    runs-on: hanzo-build-linux-amd64
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the static export
+        run: |
+          set -euo pipefail
+          # The job image (catthehacker/ubuntu:act-24.04) ships node, python and
+          # go — not ruby. ruby-dev + build-essential are for jekyll's native
+          # extensions (http_parser.rb), which fail to compile without them.
+          SUDO=; [ "$(id -u)" -eq 0 ] || SUDO=sudo
+          $SUDO apt-get update -qq
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ruby ruby-dev build-essential >/dev/null
+          # Pinned: a background jekyll release must not silently change what
+          # this site is built with.
+          $SUDO gem install --no-document jekyll:4.4.1
+          jekyll build --source docs --destination _site
+          test -s _site/index.html || { echo "::error::jekyll produced no _site/index.html"; exit 1; }
+          echo "exported $(find _site -type f | wc -l) files"
+
+      # The ONE analytics wire: cloud's hosted tag (cloud apps/analytics/tag.go),
+      # which posts the canonical batch to POST /v1/event. There is no GA, no
+      # Plausible, no second tracker, and no vendored copy of the tag — it is
+      # served from the origin that eats it so a page allowlists ONE host.
+      #
+      # The key is the project's OWN publishable key, read from the project this
+      # run is about to deploy. It is never a checked-in constant: pk- is
+      # write-only and publishable (same trust class as a Sentry DSN), so it
+      # belongs in the page, but its authority is the project record, which means
+      # rotation is one server-side change and not five repo edits.
+      #
+      # NO KEY => NO TAG, deliberately. A keyless beacon is accepted 200 into
+      # $public, a reserved tenant this org cannot read, so silence is the honest
+      # failure and we pick it over reporting into a tenant nobody reads.
+      #
+      # Injection happens HERE rather than in _layouts/default.html because the
+      # other doc sites in this fleet export rustdoc and storybook HTML that no
+      # layout of ours can reach. One mechanism for all of them.
+      - name: wire the analytics tag
+        env:
+          DEPLOY_TOKEN: ${{ secrets.HANZO_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          KEY=$(curl -sS -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+                  "https://api.hanzo.ai/v1/projects/hanzo-el" | jq -r '.key // empty')
+          if [ -z "$KEY" ]; then
+            echo "::warning::project hanzo-el exposes no publishable key — publishing untagged rather than beaconing into \$public"
+            exit 0
+          fi
+          TAG="<script defer src=\"https://api.hanzo.ai/v1/event.js\" data-key=\"${KEY}\" data-product=\"hanzo.el\"></script>"
+          find _site -name '*.html' -print0 | xargs -0 -r sed -i "s#</head>#${TAG}</head>#"
+          echo "tagged $(grep -rl 'v1/event.js' _site | wc -l) pages"
+
+      - name: enqueue the deployment
+        id: enqueue
+        env:
+          DEPLOY_TOKEN: ${{ secrets.HANZO_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_TOKEN:-}" ]; then
+            echo "::error::HANZO_DEPLOY_TOKEN is unset. It is an org secret on the git.hanzo.ai forge."
+            exit 1
+          fi
+          CODE=$(curl -sS -o /tmp/enq.json -w '%{http_code}' \
+            -X POST "https://api.hanzo.ai/v1/projects/hanzo-el/deploy" \
+            -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"source\":\"git\",\"commit\":\"${GITHUB_SHA}\",\"branch\":\"main\"}")
+          # 202 Accepted is the success code — the deployment is queued, not live.
+          if [ "$CODE" != "202" ]; then
+            echo "::error::enqueue returned HTTP $CODE"; head -c 600 /tmp/enq.json; exit 1
+          fi
+          # bucket and prefix come FROM cloud. Never hardcode them: prefix is
+          # sitePrefix(org, slug) server-side, so a local guess drifts the moment
+          # the org or slug changes and the sync lands bytes nobody serves.
+          echo "id=$(jq -r .id /tmp/enq.json)"         >> "$GITHUB_OUTPUT"
+          echo "bucket=$(jq -r .bucket /tmp/enq.json)" >> "$GITHUB_OUTPUT"
+          echo "prefix=$(jq -r .prefix /tmp/enq.json)" >> "$GITHUB_OUTPUT"
+          jq -c '{id,version,status,bucket,prefix}' /tmp/enq.json
+
+      - name: sync the export to S3
+        id: sync
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SITES_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SITES_S3_SECRET_ACCESS_KEY }}
+          BUCKET: ${{ steps.enqueue.outputs.bucket }}
+          PREFIX: ${{ steps.enqueue.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::SITES_S3_* secrets unset — cannot sync. These are the hanzo-sites bucket credentials."
+            exit 1
+          fi
+          # --delete so a removed page actually disappears: without it the prefix
+          # only ever grows and deleted pages keep serving.
+          aws s3 sync _site "s3://${BUCKET}/${PREFIX}" \
+            --endpoint-url https://s3.hanzo.ai --delete --only-show-errors
+          echo "files=$(find _site -type f | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          echo "bytes=$(du -sk _site | awk '{print $1*1024}')"   >> "$GITHUB_OUTPUT"
+
+      - name: flip it live
+        env:
+          DEPLOY_TOKEN: ${{ secrets.HANZO_DEPLOY_TOKEN }}
+          DEP: ${{ steps.enqueue.outputs.id }}
+          FILES: ${{ steps.sync.outputs.files }}
+          BYTES: ${{ steps.sync.outputs.bytes }}
+        run: |
+          set -euo pipefail
+          CODE=$(curl -sS -o /tmp/done.json -w '%{http_code}' \
+            -X POST "https://api.hanzo.ai/v1/projects/hanzo-el/deployments/${DEP}/complete" \
+            -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"status\":\"live\",\"commit\":\"${GITHUB_SHA}\",\"files\":${FILES},\"bytes\":${BYTES}}")
+          if [ "$CODE" != "200" ]; then
+            echo "::error::complete returned HTTP $CODE"; head -c 600 /tmp/done.json; exit 1
+          fi
+          jq -c '{status,liveUrl,version,files,bytes}' /tmp/done.json
+
+      # A run that dies after the enqueue would leave the deployment "queued" and
+      # the project stuck "building" forever. Report the failure so cloud records
+      # an honest terminal state instead of a lie by omission.
+      - name: report a failed build
+        if: failure() && steps.enqueue.outputs.id != ''
+        env:
+          DEPLOY_TOKEN: ${{ secrets.HANZO_DEPLOY_TOKEN }}
+          DEP: ${{ steps.enqueue.outputs.id }}
+        run: |
+          curl -sS -X POST "https://api.hanzo.ai/v1/projects/hanzo-el/deployments/${DEP}/complete" \
+            -H "Authorization: Bearer ${DEPLOY_TOKEN}" -H 'Content-Type: application/json' \
+            -d '{"status":"error","message":"CI build or sync failed"}' >/dev/null || true
+          echo "marked deployment ${DEP} as error"
