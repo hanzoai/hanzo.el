@@ -25,7 +25,7 @@ name: deploy
 on:
   push:
     branches: [main]
-    paths: ['docs/**', '.hanzo/workflows/deploy.yml']
+    paths: ['docs/**', '.github/workflows/deploy.yml']
   workflow_dispatch:
 
 concurrency:
