@@ -1,5 +1,7 @@
 # hanzo.el
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/hanzo.el&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/hanzo.el&ref=main&action=edit)
+
 Hanzo AI integration for Emacs. AI-powered code completion, explanation, refactoring, and more using Claude, GPT-4, Gemini, Ollama, and any OpenAI-compatible API.
 
 ## Features
